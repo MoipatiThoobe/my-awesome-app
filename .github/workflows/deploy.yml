@@ -1,0 +1,98 @@
+name: Deploy to AWS
+
+on:
+  push:
+    branches: [ main ]
+  workflow_dispatch:
+
+permissions:
+  id-token: write
+  contents: read
+
+jobs:
+  deploy-s3:
+    name: Deploy to S3
+    runs-on: ubuntu-latest
+    environment: production
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v3
+
+      - name: Configure AWS credentials
+        uses: aws-actions/configure-aws-credentials@v2
+        with:
+          role-to-assume: arn:aws:iam::${{ secrets.AWS_ACCOUNT_ID }}:role/GitHubActionsRole
+          aws-region: us-east-1
+
+      - name: Setup Node.js
+        uses: actions/setup-node@v3
+        with:
+          node-version: '18'
+
+      - name: Install dependencies
+        run: npm ci
+
+      - name: Build for production
+        run: |
+          mkdir -p dist
+          cp -r src/* dist/
+          cp package*.json dist/
+          echo "Deployed at $(date)" > dist/deployment-info.txt
+          echo "Commit: ${{ github.sha }}" >> dist/deployment-info.txt
+
+      - name: Deploy to S3
+        run: |
+          aws s3 sync dist/ s3://${{ secrets.S3_BUCKET_NAME }}/ --delete
+          echo "Deployment completed successfully"
+
+      - name: Invalidate CloudFront cache
+        if: ${{ secrets.CLOUDFRONT_DISTRIBUTION_ID != '' }}
+        run: |
+          aws cloudfront create-invalidation \
+            --distribution-id ${{ secrets.CLOUDFRONT_DISTRIBUTION_ID }} \
+            --paths "/*"
+
+      - name: Deployment summary
+        run: |
+          echo "✅ Deployment completed"
+          echo "📦 Bucket: ${{ secrets.S3_BUCKET_NAME }}"
+          echo "🔗 Commit: ${{ github.sha }}"
+          echo "👤 Actor: ${{ github.actor }}"
+
+  deploy-elastic-beanstalk:
+    name: Deploy to Elastic Beanstalk
+    runs-on: ubuntu-latest
+    if: false  # Set to true to enable EB deployment
+    environment: production
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v3
+
+      - name: Configure AWS credentials
+        uses: aws-actions/configure-aws-credentials@v2
+        with:
+          role-to-assume: arn:aws:iam::${{ secrets.AWS_ACCOUNT_ID }}:role/GitHubActionsRole
+          aws-region: us-east-1
+
+      - name: Generate deployment package
+        run: |
+          zip -r deploy-${{ github.sha }}.zip . -x '*.git*' 'node_modules/*' 'coverage/*'
+
+      - name: Upload to S3
+        run: |
+          aws s3 cp deploy-${{ github.sha }}.zip \
+            s3://${{ secrets.EB_BUCKET_NAME }}/deploy-${{ github.sha }}.zip
+
+      - name: Create application version
+        run: |
+          aws elasticbeanstalk create-application-version \
+            --application-name my-app \
+            --version-label ${{ github.sha }} \
+            --source-bundle S3Bucket="${{ secrets.EB_BUCKET_NAME }}",S3Key="deploy-${{ github.sha }}.zip"
+
+      - name: Deploy to environment
+        run: |
+          aws elasticbeanstalk update-environment \
+            --application-name my-app \
+            --environment-name my-app-env \
+            --version-label ${{ github.sha }}
